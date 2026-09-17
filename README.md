@@ -51,7 +51,7 @@ is a faithful preview of the deployed system.
 ### Sign-in accounts
 
 Staff accounts live in a `staff` table in **both** data stores (`demo_data.json`
-for demo, a DynamoDB `staff` table for AWS — created and seeded by
+for demo; a DynamoDB `staff` table for AWS, created and seeded by
 `deploy.py`), with passwords stored as SHA-256 hashes. The client source holds
 no accounts at all: signing in is a `login` call to the backend, the same model
 as the patient ID lookup. The honest upgrade path is a Cognito User Pool
@@ -92,7 +92,7 @@ It starts on the AWS data source. To point it at a real deployment, run
 `deploy.py`, which writes the invoke URL and API key into
 `serverless_config.json`; or press **Configure endpoint** to paste them
 manually. To try the system without any AWS account, switch **Data source** to
-*Demo (offline, no AWS)* — the choice is remembered for next time.
+*Demo (offline, no AWS)*: the choice is remembered for next time.
 **Test connection** sends a `ping` and confirms which backend answered.
 
 ## Cost and limits

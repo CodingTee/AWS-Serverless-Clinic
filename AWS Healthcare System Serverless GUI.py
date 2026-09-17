@@ -467,7 +467,7 @@ def _demo_seed():
 class DemoBackend:
     """Implements the same interface as ApiClient, but locally.
 
-    All 21 actions the Lambda supports are reproduced here with the same
+    All 22 actions the Lambda supports are reproduced here with the same
     validation (duplicate IDs, clashing slots, blocked dates, missing fields),
     so switching between demo and AWS changes nothing about how the screens
     behave. Data persists to demo_data.json; delete that file to reset.
