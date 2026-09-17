@@ -27,6 +27,7 @@
   ],
   "Appointments": [
     {
+      "record_id": "B01-2026/09/18-10:00",
       "doctor_id": "D01",
       "appointment_date": "2026/09/18",
       "appointment_time": "10:00",
@@ -34,6 +35,7 @@
       "patient_name": "Aisyah binti Ahmad"
     },
     {
+      "record_id": "B02-2026/09/19-14:30",
       "doctor_id": "D01",
       "appointment_date": "2026/09/19",
       "appointment_time": "14:30",
@@ -41,6 +43,7 @@
       "patient_name": "Daniel Wong"
     },
     {
+      "record_id": "B03-2026/09/20-09:00",
       "doctor_id": "D02",
       "appointment_date": "2026/09/20",
       "appointment_time": "09:00",

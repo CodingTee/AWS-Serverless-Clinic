@@ -259,7 +259,8 @@ def op_appointments_for_doctor(payload):
 def op_appointments_for_patient(payload):
     require(payload, "patient_id")
     return by_partition_key(
-        appointments_table, "patient_id", payload["patient_id"].strip()
+        appointments_table, "patient_id", payload["patient_id"].strip(),
+        index_name="patient_id-index",
     )
 
 
@@ -288,13 +289,27 @@ def op_schedule_appointment(payload):
         raise BusinessError(f"{doctor_id} is not available on {date}.")
 
     item = {
+        # Deterministic record id: one row per patient/date/time. The table's
+        # primary key IS this attribute, so the condition below makes the
+        # duplicate check atomic instead of check-then-put.
+        "record_id": f'{patient["patient_id"]}-{date}-{time}',
         "doctor_id": doctor_id,
         "appointment_date": date,
         "appointment_time": time,
         "patient_id": patient["patient_id"],
         "patient_name": patient.get("patient_name", ""),
     }
-    appointments_table.put_item(Item=item)
+    try:
+        appointments_table.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(record_id)",
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise BusinessError(
+                f'{patient["patient_id"]} already has an appointment at {time} on {date}.'
+            )
+        raise
     return item
 
 
@@ -387,16 +402,16 @@ def op_delete_medical_records(payload):
     require(payload, "patient_id")
     patient_id = payload["patient_id"].strip()
     records = by_partition_key(medical_records_table, "patient_id", patient_id)
+    # record_id is the table's only key attribute; rows without one (should
+    # not exist, but legacy data) cannot be addressed by delete_item at all,
+    # so they are skipped rather than "deleted" into a no-op.
+    deleted = 0
     for record in records:
-        try:
-            medical_records_table.delete_item(
-                Key={"record_id": record["record_id"]}
-            )
-        except KeyError:
-            medical_records_table.delete_item(
-                Key={"patient_id": record["patient_id"]}
-            )
-    return {"deleted": len(records)}
+        if "record_id" not in record:
+            continue
+        medical_records_table.delete_item(Key={"record_id": record["record_id"]})
+        deleted += 1
+    return {"deleted": deleted}
 
 
 # ---------------------------------------------------------------------------

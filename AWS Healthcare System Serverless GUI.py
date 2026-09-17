@@ -425,11 +425,14 @@ def _demo_seed():
              "patient_number": "013-9876 5432", "patient_BOD": "2003/03/03"},
         ],
         "Appointments": [
-            {"doctor_id": "D01", "appointment_date": day(2), "appointment_time": "10:00",
+            {"record_id": f"B01-{day(2)}-10:00", "doctor_id": "D01",
+             "appointment_date": day(2), "appointment_time": "10:00",
              "patient_id": "B01", "patient_name": "Aisyah binti Ahmad"},
-            {"doctor_id": "D01", "appointment_date": day(3), "appointment_time": "14:30",
+            {"record_id": f"B02-{day(3)}-14:30", "doctor_id": "D01",
+             "appointment_date": day(3), "appointment_time": "14:30",
              "patient_id": "B02", "patient_name": "Daniel Wong"},
-            {"doctor_id": "D02", "appointment_date": day(4), "appointment_time": "09:00",
+            {"record_id": f"B03-{day(4)}-09:00", "doctor_id": "D02",
+             "appointment_date": day(4), "appointment_time": "09:00",
              "patient_id": "B03", "patient_name": "Nurul Huda"},
         ],
         "medicalRecord": [
@@ -729,12 +732,19 @@ class DemoBackend:
             raise ValueError(f"{doctor_id} is not available on {date}.")
 
         item = {
+            # Same deterministic id as the Lambda; the duplicate check below
+            # mirrors its attribute_not_exists(record_id) condition.
+            "record_id": f'{patient["patient_id"]}-{date}-{time}',
             "doctor_id": doctor_id,
             "appointment_date": date,
             "appointment_time": time,
             "patient_id": patient["patient_id"],
             "patient_name": patient.get("patient_name", ""),
         }
+        if self._find("Appointments", record_id=item["record_id"]):
+            raise ValueError(
+                f'{patient["patient_id"]} already has an appointment at {time} on {date}.'
+            )
         self.data["Appointments"].append(item)
         self.save()
         return item

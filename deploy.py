@@ -39,10 +39,17 @@ USAGE_PLAN_NAME = "clinic-client-plan"
 BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
 
 # key_schema: (hash_key, range_key or None). gsi: (name, hash_key) or None.
+# gsis: [(name, hash_key), ...] for tables that need more than one index.
 TABLE_SCHEMAS = {
     "patients": {"hash": "patient_id"},
     "staff": {"hash": "username"},
-    "Appointments": {"hash": "patient_id", "gsi": ("doctor_id-index", "doctor_id")},
+    # record_id (patient-date-time) instead of patient_id: a patient may hold
+    # several appointments, and a patient_id primary key would silently
+    # overwrite the previous one on every new booking.
+    "Appointments": {
+        "hash": "record_id",
+        "gsis": [("doctor_id-index", "doctor_id"), ("patient_id-index", "patient_id")],
+    },
     "medicalRecord": {"hash": "record_id"},
     "receipts": {"hash": "receipt_id"},
     "availability": {"hash": "doctor_id", "range": "date"},
@@ -84,34 +91,48 @@ def hash_password(password):
 # ---------------------------------------------------------------------------
 def ensure_tables():
     step("Ensuring DynamoDB tables")
-    existing = {t["TableName"] for t in dynamodb.meta.client.list_tables()["TableNames"]}
+    # TableNames is a plain list of strings, not a list of dicts.
+    existing = set(dynamodb.meta.client.list_tables()["TableNames"])
     for name in TABLES:
         schema = TABLE_SCHEMAS[name]
         if name in existing:
-            ok(f"Table {name} already exists")
+            # Warn when an old deployment has a mismatched key layout: the
+            # code above will happily run against the wrong schema otherwise.
+            actual = dynamodb.meta.client.describe_table(TableName=name)["Table"]["KeySchema"]
+            actual_hash = next(k["AttributeName"] for k in actual if k["KeyType"] == "HASH")
+            if actual_hash != schema["hash"]:
+                ok(f"WARNING: {name} uses {actual_hash} as hash key but the code "
+                   f"expects {schema['hash']}. Delete the table to migrate.")
+            else:
+                ok(f"Table {name} already exists")
             continue
         key_schema = [{"AttributeName": schema["hash"], "KeyType": "HASH"}]
-        attribute_definitions = [
-            {"AttributeName": schema["hash"], "AttributeType": "S"}
-        ]
         if schema.get("range"):
             key_schema.append({"AttributeName": schema["range"], "KeyType": "RANGE"})
-            attribute_definitions.append(
-                {"AttributeName": schema["range"], "AttributeType": "S"}
-            )
-        kwargs = {}
+
+        attribute_names = {schema["hash"]}
+        if schema.get("range"):
+            attribute_names.add(schema["range"])
+
+        gsis = list(schema.get("gsis", []))
         if schema.get("gsi"):
-            gsi_name, gsi_hash = schema["gsi"]
-            key_schema_gsi = [{"AttributeName": gsi_hash, "KeyType": "HASH"}]
-            if gsi_hash != schema["hash"]:
-                attribute_definitions.append(
-                    {"AttributeName": gsi_hash, "AttributeType": "S"}
-                )
-            kwargs["GlobalSecondaryIndexes"] = [{
-                "IndexName": gsi_name,
-                "KeySchema": key_schema_gsi,
-                "Projection": {"ProjectionType": "ALL"},
-            }]
+            gsis.append(schema["gsi"])
+        kwargs = {}
+        if gsis:
+            gsi_definitions = []
+            for gsi_name, gsi_hash in gsis:
+                attribute_names.add(gsi_hash)
+                gsi_definitions.append({
+                    "IndexName": gsi_name,
+                    "KeySchema": [{"AttributeName": gsi_hash, "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                })
+            kwargs["GlobalSecondaryIndexes"] = gsi_definitions
+
+        attribute_definitions = [
+            {"AttributeName": attr, "AttributeType": "S"}
+            for attr in sorted(attribute_names)
+        ]
         dynamodb.create_table(
             TableName=name,
             KeySchema=key_schema,
