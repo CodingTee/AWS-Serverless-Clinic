@@ -127,8 +127,8 @@ manually. To try the system without any AWS account, switch **Data source** to
   the backend can enforce per-role permissions (right now the backend trusts
   the client to send sensible actions, exactly like the original project).
 - Bedrock model is set via the `BEDROCK_MODEL_ID` environment variable on the
-  Lambda (default: `anthropic.claude-3-haiku-20240307-v1:0`). Enable the model
-  in the Bedrock console before using the consultation feature.
+  Lambda (`deploy.py` picks the default). Enable the model in the Bedrock
+  console before using the consultation feature.
 - The Lambda code and the demo backend are deliberately kept in step: same
   action names, same validation messages. If you add an action, add it to both
   (plus `ROUTES` in each) or the two modes will drift apart.
