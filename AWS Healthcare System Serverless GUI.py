@@ -1231,7 +1231,7 @@ class LoginFrame(ttk.Frame):
 
         # Both modes: the backend owns staff accounts (demo -> demo_data.json,
         # AWS -> DynamoDB staff table). This client holds no credentials.
-        # NOTE: read the tk variables HERE, on the main thread -- the worker
+        # NOTE: read the tk variables HERE, on the main thread; the worker
         # thread must never touch Tk (StringVar.get() included).
         password = self.password.get()
         self.app.set_status(f"Looking up staff account {username} ...")

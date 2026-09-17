@@ -36,11 +36,11 @@ added afterwards for backend login.
 AWS Lambda: the API Gateway trigger on the backend function, which reads
 DynamoDB and calls Bedrock:
 
-![AWS Lambda console showing the API Gateway trigger](images/lambda_console.png)
+![AWS Lambda console showing the API Gateway trigger](images/aws-lambda-console.png)
 
 DynamoDB item explorer on the `patients` table (fictional seed data):
 
-![DynamoDB item explorer showing the patients table](images/dynamodb_console.png)
+![DynamoDB item explorer showing the patients table](images/aws-dynamodb-console.png)
 
 ## Files
 
