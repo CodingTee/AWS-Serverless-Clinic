@@ -50,7 +50,7 @@ DynamoDB item explorer on the `patients` table (fictional seed data):
 
 | File | Purpose |
 |---|---|
-| `lambda_function.py` | The backend. One function, 22 routed actions (including staff login), all DynamoDB and Bedrock access. |
+| `lambda_function.py` | The backend. One function, 23 routed actions (including staff login), all DynamoDB and Bedrock access, plus per-role authorization on every call. |
 | `deploy.py` | Creates/updates the IAM role, Lambda, REST API, API key and stage. Run once, re-runnable. |
 | `AWS Healthcare System Serverless GUI.py` | The desktop client. Talks only HTTPS to API Gateway, or to the local demo backend. |
 | `serverless_config.json` | Invoke URL + API key + which data source to use. Keep the key out of git. |
@@ -65,18 +65,42 @@ the primary path of this project); the last choice is remembered in
 | Mode | What it does | Needs AWS? |
 |---|---|---|
 | **AWS (API Gateway)** (default) | The real path: HTTPS to API Gateway, which invokes the Lambda, which talks to DynamoDB and Bedrock. Requires `deploy.py` to have run. | Yes |
-| **Demo (offline)** | A local `DemoBackend` implements all 22 actions with the same checks the Lambda performs (staff login, duplicate patient/receipt IDs, clashing slots, blocked dates, missing fields). Changes persist to `demo_data.json`. The AI consultation returns canned guidance instead of calling Bedrock. | No |
+| **Demo (offline)** | A local `DemoBackend` implements all 23 actions with the same checks the Lambda performs (staff login, duplicate patient/receipt IDs, clashing slots, blocked dates, missing fields). Changes persist to `demo_data.json`. The AI consultation returns canned guidance instead of calling Bedrock. | No |
 
 The screens, buttons and error dialogs are identical in both modes, so the demo
 is a faithful preview of the deployed system.
+
+### Sessions and per-role authorization
+
+Sign-in returns a session token; every later call carries it and the backend
+decides what the role may do. The enforcement lives in the backend, not the
+client: a tampered client cannot read another patient's records by editing the
+request.
+
+- Roles: 1 receptionist, 2 doctor, 3 nurse, 4 patient. Each action has an
+  allowed-role set (`ACTION_ROLES`, identical in both backends); anything not
+  listed is rejected.
+- Patients are restricted to their **own** ID: the backend compares the
+  `patient_id` in each request against the token's claim, so patients cannot
+  view, book or consult for anyone else, and they cannot register new patients.
+- Tokens are HMAC-signed and expire after 12 hours. The signing secret is a
+  Lambda environment variable generated fresh by each `deploy.py` run, so a
+  redeploy invalidates old sessions.
+- Patients sign in with their ID only (no password, same as the original
+  system) via a `patient_login` action that issues their token.
+
+The AWS path is the same model one step up: with a Cognito User Pool
+authorizer the JWT claims would replace the hand-rolled token, and the
+permission matrix would stay exactly where it is (see the notes at the end).
 
 ### Sign-in accounts
 
 Staff accounts live in a `staff` table in **both** data stores (`demo_data.json`
 for demo; a DynamoDB `staff` table for AWS, created and seeded by
 `deploy.py`), with passwords stored as SHA-256 hashes. The client source holds
-no accounts at all: signing in is a `login` call to the backend, the same model
-as the patient ID lookup. The honest upgrade path is a Cognito User Pool
+no accounts at all: signing in is a `login` call to the backend, and patients
+sign in by ID via `patient_login`. Both issue the session token described
+above. The honest upgrade path is a Cognito User Pool
 (salted adaptive hashing, MFA, per-user tokens), which would replace the
 hand-rolled `login` action without touching the client (see the notes at the
 end).
@@ -126,13 +150,15 @@ manually. To try the system without any AWS account, switch **Data source** to
 
 ## Notes for the future
 
-- API key is better than nothing but it is still a shared secret. The next
-  step up is a Cognito authorizer on API Gateway so each user signs in and
-  the backend can enforce per-role permissions (right now the backend trusts
-  the client to send sensible actions, exactly like the original project).
+- Per-role authorization is now enforced by the backend on every call. The
+  next step up is a Cognito User Pool authorizer on API Gateway: real user
+  accounts with salted adaptive hashing and MFA, JWT claims instead of the
+  hand-rolled token, and per-user API access instead of a shared API key.
+  The permission matrix would not need to move.
 - Bedrock model is set via the `BEDROCK_MODEL_ID` environment variable on the
   Lambda (`deploy.py` picks the default). Enable the model in the Bedrock
   console before using the consultation feature.
 - The Lambda code and the demo backend are deliberately kept in step: same
-  action names, same validation messages. If you add an action, add it to both
-  (plus `ROUTES` in each) or the two modes will drift apart.
+  action names, same validation messages, same authorization matrix. If you
+  add an action, add it to both (plus `ROUTES` and `ACTION_ROLES` in each) or
+  the two modes will drift apart.

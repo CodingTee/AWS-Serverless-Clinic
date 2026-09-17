@@ -16,9 +16,12 @@ under an IAM execution role, so no credentials appear anywhere in the code.
 Deploy with deploy.py in the same folder.
 """
 
+import base64
 import hashlib
+import hmac
 import json
 import os
+import time
 from datetime import datetime
 from decimal import Decimal
 
@@ -30,6 +33,8 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 BEDROCK_MODEL_ID = os.environ.get(
     "BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"
 )
+# Signs session tokens. deploy.py generates a fresh value on every run.
+SESSION_SECRET = os.environ.get("SESSION_SECRET")
 
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
 bedrock = boto3.client("bedrock-runtime", region_name=REGION)
@@ -46,6 +51,109 @@ medications_table = dynamodb.Table("medications")
 
 class BusinessError(Exception):
     """A refusal the client should show as-is (duplicate ID, blocked date...)."""
+
+
+# ---------------------------------------------------------------------------
+# Sessions and per-role authorization
+# ---------------------------------------------------------------------------
+TOKEN_TTL_SECONDS = 12 * 3600
+
+# Actions anyone may call before signing in.
+PRE_AUTH_ACTIONS = {"ping", "login", "patient_login"}
+
+# Which signed-in roles may call which action. Roles: 1 receptionist,
+# 2 doctor, 3 nurse, 4 patient. The matrix mirrors what the GUI actually
+# offers each role; anything not listed here is rejected for everybody.
+ACTION_ROLES = {
+    "list_patients": {"1"},
+    "get_patient": {"1", "2", "3", "4"},
+    "create_patient": {"1"},
+    "update_patient": {"1"},
+    "update_patient_contact": {"1", "4"},
+    "schedule_appointment": {"1", "4"},
+    "appointments_for_doctor": {"2", "3"},
+    "appointments_for_patient": {"4"},
+    "list_receipts": {"1"},
+    "get_receipt": {"1"},
+    "receipts_for_patient": {"4"},
+    "create_receipt": {"1"},
+    "medical_records": {"2", "3", "4"},
+    "add_medical_record": {"2"},
+    "delete_medical_records": {"2"},
+    "set_availability": {"2", "3"},
+    "availability_for_doctor": {"2", "3"},
+    "add_observation": {"3"},
+    "add_medication": {"3"},
+    "consultation": {"4"},
+}
+
+# Role 4 (patient) may only ever touch its OWN patient_id. These actions
+# carry a patient_id in the payload that must match the token's claim.
+PATIENT_OWN_ACTIONS = {
+    "get_patient",
+    "update_patient_contact",
+    "schedule_appointment",
+    "appointments_for_patient",
+    "receipts_for_patient",
+    "medical_records",
+    "consultation",
+}
+
+
+def _issue_token(role, patient_id):
+    """Sign a stateless session token: base64(role|patient_id|expiry).hmac."""
+    if not SESSION_SECRET:
+        raise BusinessError(
+            "The backend has no session secret configured. Re-run deploy.py "
+            "to generate one."
+        )
+    expires = int(time.time()) + TOKEN_TTL_SECONDS
+    body = f"{role}|{patient_id or ''}|{expires}"
+    signature = hmac.new(
+        SESSION_SECRET.encode("utf-8"), body.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return base64.urlsafe_b64encode(body.encode("utf-8")).decode("ascii") + "." + signature
+
+
+def _read_token(token):
+    """Verify a session token and return its claims, or raise BusinessError."""
+    if not SESSION_SECRET:
+        raise BusinessError(
+            "The backend has no session secret configured. Re-run deploy.py "
+            "to generate one."
+        )
+    if not token or token.count(".") != 1:
+        raise BusinessError("Your session is invalid. Sign in again.")
+    encoded, signature = token.split(".")
+    try:
+        body = base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        raise BusinessError("Your session is invalid. Sign in again.")
+    expected = hmac.new(
+        SESSION_SECRET.encode("utf-8"), body.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise BusinessError("Your session is invalid. Sign in again.")
+    role, patient_id, expires = body.split("|")
+    if int(expires) < time.time():
+        raise BusinessError("Your session has expired. Sign in again.")
+    return {"role": role, "patient_id": patient_id or None}
+
+
+def enforce_access(action, payload):
+    """Validate the token in the payload and check the role is allowed.
+
+    Returns the token claims. Raises BusinessError on any failure.
+    """
+    claims = _read_token(payload.pop("token", None))
+    allowed = ACTION_ROLES.get(action)
+    if allowed is None or claims["role"] not in allowed:
+        raise BusinessError("Your role is not authorized for this action.")
+    if claims["role"] == "4" and action in PATIENT_OWN_ACTIONS:
+        requested = str(payload.get("patient_id", "")).strip()
+        if requested != claims["patient_id"]:
+            raise BusinessError("Patients may only access their own records.")
+    return claims
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +269,30 @@ def op_login(payload):
         raise BusinessError("Incorrect password.")
     if str(account.get("role")) != role:
         raise BusinessError("This account belongs to a different role.")
-    return {"role": role, "display_name": account["username"]}
+    return {
+        "role": role,
+        "display_name": account["username"],
+        "token": _issue_token(role, None),
+    }
+
+
+def op_patient_login(payload):
+    """Patient sign-in by ID (no password, same as the original system).
+
+    Issues a role-4 token so every later call can be checked against the
+    patient's own ID server-side.
+    """
+    require(payload, "patient_id")
+    patient_id = payload["patient_id"].strip()
+    patient = patients_table.get_item(Key={"patient_id": patient_id}).get("Item")
+    if not patient:
+        raise BusinessError(f"No patient with ID {patient_id}.")
+    return {
+        "patient_id": patient_id,
+        "patient_name": patient.get("patient_name", patient_id),
+        "role": "4",
+        "token": _issue_token("4", patient_id),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +661,7 @@ def op_consultation(payload):
 ROUTES = {
     "ping": lambda _payload: {"service": "clinic-serverless", "time": datetime.now().isoformat()},
     "login": op_login,
+    "patient_login": op_patient_login,
     "list_patients": op_list_patients,
     "get_patient": op_get_patient,
     "create_patient": op_create_patient,
@@ -570,6 +702,8 @@ def lambda_handler(event, _context):
         })
 
     try:
+        if action not in PRE_AUTH_ACTIONS:
+            enforce_access(action, payload)
         data = handler(payload)
         return respond(200, {"ok": True, "data": clean(data)})
     except BusinessError as exc:

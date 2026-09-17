@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import queue
+import secrets
 import threading
 import time
 import traceback
@@ -222,6 +223,7 @@ class ApiClient:
     def __init__(self):
         self.api_url = None
         self.api_key = None
+        self._token = None  # session token issued by login/patient_login
         self.load_config()
 
     # -- configuration -----------------------------------------------------
@@ -263,6 +265,8 @@ class ApiClient:
     # -- transport ---------------------------------------------------------
     def call(self, action, timeout=35, **payload):
         self.ensure_configured()
+        if self._token:
+            payload = {**payload, "token": self._token}
         response = requests.post(
             self.api_url,
             json={"action": action, "payload": payload},
@@ -277,7 +281,14 @@ class ApiClient:
 
     # -- auth --------------------------------------------------------------
     def login(self, username, password, role):
-        return self.call("login", username=username, password=password, role=role)
+        result = self.call("login", username=username, password=password, role=role)
+        self._token = result["token"]
+        return result
+
+    def patient_login(self, patient_id):
+        result = self.call("patient_login", patient_id=patient_id)
+        self._token = result["token"]
+        return result
 
     # -- patients ----------------------------------------------------------
     def get_patient(self, patient_id):
@@ -467,7 +478,7 @@ def _demo_seed():
 class DemoBackend:
     """Implements the same interface as ApiClient, but locally.
 
-    All 22 actions the Lambda supports are reproduced here with the same
+    All 23 actions the Lambda supports are reproduced here with the same
     validation (duplicate IDs, clashing slots, blocked dates, missing fields),
     so switching between demo and AWS changes nothing about how the screens
     behave. Data persists to demo_data.json; delete that file to reset.
@@ -475,9 +486,46 @@ class DemoBackend:
 
     mode = "demo"
 
+    # -- per-role authorization: keep in step with lambda_function.py ------
+    # Roles: 1 receptionist, 2 doctor, 3 nurse, 4 patient.
+    PRE_AUTH_ACTIONS = {"ping", "login", "patient_login"}
+    ACTION_ROLES = {
+        "list_patients": {"1"},
+        "get_patient": {"1", "2", "3", "4"},
+        "create_patient": {"1"},
+        "update_patient": {"1"},
+        "update_patient_contact": {"1", "4"},
+        "schedule_appointment": {"1", "4"},
+        "appointments_for_doctor": {"2", "3"},
+        "appointments_for_patient": {"4"},
+        "list_receipts": {"1"},
+        "get_receipt": {"1"},
+        "receipts_for_patient": {"4"},
+        "create_receipt": {"1"},
+        "medical_records": {"2", "3", "4"},
+        "add_medical_record": {"2"},
+        "delete_medical_records": {"2"},
+        "set_availability": {"2", "3"},
+        "availability_for_doctor": {"2", "3"},
+        "add_observation": {"3"},
+        "add_medication": {"3"},
+        "consultation": {"4"},
+    }
+    PATIENT_OWN_ACTIONS = {
+        "get_patient",
+        "update_patient_contact",
+        "schedule_appointment",
+        "appointments_for_patient",
+        "receipts_for_patient",
+        "medical_records",
+        "consultation",
+    }
+
     def __init__(self):
         self.store_path = Path(__file__).with_name("demo_data.json")
         self._lock = threading.Lock()  # serialize read-modify-write handlers
+        self._token = None             # current session token, set on login
+        self.sessions = {}             # token -> {"role", "patient_id"}
         if self.store_path.exists():
             self.data = json.loads(self.store_path.read_text(encoding="utf-8"))
         else:
@@ -502,15 +550,39 @@ class DemoBackend:
         handler = self.ROUTES.get(action)
         if handler is None:
             raise ValueError(f"Unknown action '{action}'.")
+        if self._token:
+            payload = {**payload, "token": self._token}
         time.sleep(0.25)  # simulate network + Lambda latency
         # Each async call runs on its own thread; without this lock two
         # overlapping writes could lose each other's changes in demo_data.json.
         with self._lock:
+            if action not in self.PRE_AUTH_ACTIONS:
+                self._enforce_access(action, payload)
             return handler(self, payload)
+
+    def _enforce_access(self, action, payload):
+        """Mirror the Lambda's enforce_access: token -> role -> own-only."""
+        session = self.sessions.get(payload.pop("token", None))
+        if session is None:
+            raise ValueError("Your session has expired. Sign in again.")
+        allowed = self.ACTION_ROLES.get(action)
+        if allowed is None or session["role"] not in allowed:
+            raise ValueError("Your role is not authorized for this action.")
+        if session["role"] == "4" and action in self.PATIENT_OWN_ACTIONS:
+            requested = str(payload.get("patient_id", "")).strip()
+            if requested != session["patient_id"]:
+                raise ValueError("Patients may only access their own records.")
 
     # -- semantic methods: same signatures as ApiClient --------------------
     def login(self, username, password, role):
-        return self.call("login", username=username, password=password, role=role)
+        result = self.call("login", username=username, password=password, role=role)
+        self._token = result["token"]
+        return result
+
+    def patient_login(self, patient_id):
+        result = self.call("patient_login", patient_id=patient_id)
+        self._token = result["token"]
+        return result
 
     def get_patient(self, patient_id):
         return self.call("get_patient", patient_id=patient_id)
@@ -655,7 +727,24 @@ class DemoBackend:
             raise ValueError("Incorrect password.")
         if str(account.get("role")) != role:
             raise ValueError("This account belongs to a different role.")
-        return {"role": role, "display_name": account["username"]}
+        token = secrets.token_hex(16)
+        self.sessions[token] = {"role": role, "patient_id": None}
+        return {"role": role, "display_name": account["username"], "token": token}
+
+    def op_patient_login(self, payload):
+        # Mirrors Lambda's op_patient_login: ID-only sign-in that issues a
+        # role-4 token so later calls are checked against it server-side.
+        self._require(payload, "patient_id")
+        patient_id = str(payload["patient_id"]).strip()
+        patient = self._must_get_patient(patient_id)
+        token = secrets.token_hex(16)
+        self.sessions[token] = {"role": "4", "patient_id": patient_id}
+        return {
+            "patient_id": patient_id,
+            "patient_name": patient.get("patient_name", patient_id),
+            "role": "4",
+            "token": token,
+        }
 
     # -- patients ----------------------------------------------------------
     def op_list_patients(self, _payload):
@@ -914,6 +1003,7 @@ class DemoBackend:
     # -- routing (mirrors lambda_function.ROUTES) --------------------------
     ROUTES = {
         "login": op_login,
+        "patient_login": op_patient_login,
         "ping": lambda self, _p: {"service": "clinic-demo", "patients": len(self.data["patients"])},
         "list_patients": op_list_patients,
         "get_patient": op_get_patient,
@@ -1216,7 +1306,7 @@ class LoginFrame(ttk.Frame):
                 return
             self.app.set_status(f"Looking up patient {patient_id} ...")
             self.app.run_async(
-                lambda: self.app.db.get_patient(patient_id),
+                lambda: self.app.db.patient_login(patient_id),
                 lambda patient: self.finish_patient_login(patient_id, patient),
                 self.app.show_error,
             )
@@ -1398,6 +1488,7 @@ class ClinicApp(tk.Tk):
     def login_success(self, role_code, display_name, patient_id=None):
         self.current_role = role_code
         self.patient_id = patient_id
+        self.display_name = display_name
         label = ROLE_LABELS[role_code]
         self.set_status(f"Signed in as {display_name} ({label}) | {self.db.endpoint_label}")
         if role_code == "1":
@@ -1466,7 +1557,6 @@ class ClinicApp(tk.Tk):
                 ("View my appointments", "Appointments booked under your ID.", self.action_view_own_appointments),
                 ("View payment history", "Receipts issued under your ID.", self.action_view_own_payments),
                 ("Update my contact info", "Change the address and phone number on file.", self.action_update_own_contact),
-                ("Register new patient", "Create an additional patient record.", self.action_register_patient),
             ],
         )
 
@@ -1552,6 +1642,14 @@ class ClinicApp(tk.Tk):
         return None
 
     def action_schedule_appointment(self):
+        if self.app.current_role == "4":
+            # Patients book for themselves only; the backend enforces this
+            # against the session token, so skip the patient picker.
+            self.open_schedule_form(
+                [{"patient_id": self.app.patient_id,
+                  "patient_name": self.app.display_name}]
+            )
+            return
         self.run_async(self.db.list_patients, self.open_schedule_form, self.show_error)
 
     def open_schedule_form(self, patients):

@@ -21,6 +21,7 @@ the client script, so it works out of the box.
 
 import hashlib
 import json
+import secrets
 import time
 import zipfile
 from pathlib import Path
@@ -228,6 +229,9 @@ def zip_lambda():
 
 def ensure_lambda(role_arn, code_bytes):
     step("Ensuring Lambda function")
+    # Signs client session tokens. Fresh value per run: old tokens simply
+    # stop working after a redeploy, which is the behaviour we want.
+    session_secret = secrets.token_hex(32)
     try:
         lam.get_function(FunctionName=FUNCTION_NAME)
         lam.update_function_code(
@@ -239,7 +243,10 @@ def ensure_lambda(role_arn, code_bytes):
             Handler="lambda_function.lambda_handler",
             Timeout=30,
             MemorySize=256,
-            Environment={"Variables": {"BEDROCK_MODEL_ID": BEDROCK_MODEL_ID}},
+            Environment={"Variables": {
+                "BEDROCK_MODEL_ID": BEDROCK_MODEL_ID,
+                "SESSION_SECRET": session_secret,
+            }},
         )
         ok(f"Updated existing function {FUNCTION_NAME}")
     except lam.exceptions.ResourceNotFoundException:
@@ -253,7 +260,10 @@ def ensure_lambda(role_arn, code_bytes):
                     ZipFile=code_bytes,
                     Timeout=30,
                     MemorySize=256,
-                    Environment={"Variables": {"BEDROCK_MODEL_ID": BEDROCK_MODEL_ID}},
+                    Environment={"Variables": {
+                        "BEDROCK_MODEL_ID": BEDROCK_MODEL_ID,
+                        "SESSION_SECRET": session_secret,
+                    }},
                 )
                 ok(f"Created function {FUNCTION_NAME}")
                 break
