@@ -6,3 +6,8 @@ lambda_function.zip
 
 __pycache__/
 *.pyc
+
+# original raw screenshots: they show the account banner (account id + email)
+# and are kept only as local source material for the cropped images/ copies
+/AWS Lambda.png
+/AWS Database.png

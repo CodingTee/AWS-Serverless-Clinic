@@ -1,11 +1,12 @@
 # Clinic Management System, Serverless Edition
 
-Same four roles and the same seven DynamoDB tables as the original CLI project,
-but restructured so the client never touches AWS:
+Same four roles and the same seven DynamoDB tables as the original CLI project
+(plus a `staff` table added for backend login), but restructured so the client
+never touches AWS:
 
 ```
 Desktop client (tkinter)      API Gateway (API key)      Lambda (IAM role)
-HTTP POST /call  ---------->  validates key  ---------->  DynamoDB x7
+HTTP POST /call  ---------->  validates key  ---------->  DynamoDB x8
 {"action": "..."}                                         Bedrock (AI consult)
 
                        or, with no AWS account at all:
@@ -23,6 +24,23 @@ Desktop client (tkinter)  -->  DemoBackend (local)  -->  demo_data.json
   `lambda_function.py`, the Bedrock `invoke_model` call, and the `requests`
   POST in the client. Switching the data source to AWS uses all of them
   unchanged. The demo mode is an addition, not a replacement.
+
+## Screenshots
+
+From the original September 2025 deployment on AWS, the project this
+repository was rebuilt from. A few names differ from the current `deploy.py`:
+the old function was `ReplyQuestion` (its unauthenticated endpoint is gone,
+the AI consultation now runs inside the backend), and the `staff` table was
+added afterwards for backend login.
+
+AWS Lambda: the API Gateway trigger on the backend function, which reads
+DynamoDB and calls Bedrock:
+
+![AWS Lambda console showing the API Gateway trigger](images/lambda_console.png)
+
+DynamoDB item explorer on the `patients` table (fictional seed data):
+
+![DynamoDB item explorer showing the patients table](images/dynamodb_console.png)
 
 ## Files
 
