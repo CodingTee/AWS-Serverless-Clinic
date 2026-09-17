@@ -1,5 +1,9 @@
 # Clinic Management System, Serverless Edition
 
+A tkinter desktop client that never touches AWS directly: API Gateway +
+Lambda + DynamoDB + Bedrock behind one authenticated endpoint, plus an
+offline demo mode that runs the whole system with no AWS account at all.
+
 Same four roles and the same seven DynamoDB tables as the original CLI project
 (plus a `staff` table added for backend login), but restructured so the client
 never touches AWS:
