@@ -1,0 +1,130 @@
+{
+  "patients": [
+    {
+      "patient_id": "B01",
+      "patient_name": "Aisyah binti Ahmad",
+      "patient_IC": "010101-01-0101",
+      "patient_address": "12, Jalan Kenari, Cyberjaya",
+      "patient_number": "012-345 6789",
+      "patient_BOD": "2001/01/01"
+    },
+    {
+      "patient_id": "B02",
+      "patient_name": "Daniel Wong",
+      "patient_IC": "020202-02-0202",
+      "patient_address": "88, Jalan Bunga Raya, Puchong",
+      "patient_number": "011-2233 4455",
+      "patient_BOD": "2002/02/02"
+    },
+    {
+      "patient_id": "B03",
+      "patient_name": "Nurul Huda",
+      "patient_IC": "030303-03-0303",
+      "patient_address": "5, Jalan Saujana, Shah Alam",
+      "patient_number": "013-9876 5432",
+      "patient_BOD": "2003/03/03"
+    }
+  ],
+  "Appointments": [
+    {
+      "doctor_id": "D01",
+      "appointment_date": "2026/09/18",
+      "appointment_time": "10:00",
+      "patient_id": "B01",
+      "patient_name": "Aisyah binti Ahmad"
+    },
+    {
+      "doctor_id": "D01",
+      "appointment_date": "2026/09/19",
+      "appointment_time": "14:30",
+      "patient_id": "B02",
+      "patient_name": "Daniel Wong"
+    },
+    {
+      "doctor_id": "D02",
+      "appointment_date": "2026/09/20",
+      "appointment_time": "09:00",
+      "patient_id": "B03",
+      "patient_name": "Nurul Huda"
+    }
+  ],
+  "medicalRecord": [
+    {
+      "record_id": "B01-2026-09-09-090000",
+      "patient_id": "B01",
+      "diagnosis": "Acute pharyngitis",
+      "prescriptions": "Paracetamol 500mg, 3 times daily",
+      "treatment_plan": "Rest and drink plenty of water",
+      "date": "2026-09-09"
+    },
+    {
+      "record_id": "B02-2026-09-13-110000",
+      "patient_id": "B02",
+      "diagnosis": "Mild gastritis",
+      "prescriptions": "Antacid, after meals",
+      "treatment_plan": "Avoid spicy food",
+      "date": "2026-09-13"
+    }
+  ],
+  "receipts": [
+    {
+      "receipt_id": "R01",
+      "patient_id": "B01",
+      "patient_name": "Aisyah binti Ahmad",
+      "method": "Cash",
+      "amount": 120,
+      "date": "2026/09/16"
+    },
+    {
+      "receipt_id": "R02",
+      "patient_id": "B02",
+      "patient_name": "Daniel Wong",
+      "method": "Bank",
+      "amount": 250,
+      "date": "2026/09/15"
+    }
+  ],
+  "availability": [
+    {
+      "doctor_id": "D01",
+      "date": "2026/09/25",
+      "status": "block"
+    }
+  ],
+  "observations": [
+    {
+      "observation_id": "B01-2026-09-09-091500",
+      "patient_id": "B01",
+      "patient_name": "Aisyah binti Ahmad",
+      "blood_pressure": "118/76",
+      "pulse": "78",
+      "temperature": "37.1"
+    }
+  ],
+  "medications": [
+    {
+      "medication_id": "B01-2026-09-09-093000",
+      "patient_id": "B01",
+      "medicine": "Paracetamol",
+      "dosage": "500mg",
+      "time_given": "09:30"
+    }
+  ],
+  "staff": [
+    {
+      "username": "Sara",
+      "role": "1",
+      "password_sha256": "926b4b8a00cfab44b758450fa6bf188d4bf8541c2fd6b3d9b93d152d43a99f64"
+    },
+    {
+      "username": "Bob",
+      "role": "2",
+      "password_sha256": "8d059c3640b97180dd2ee453e20d34ab0cb0f2eccbe87d01915a8e578a202b11"
+    },
+    {
+      "username": "Charlie",
+      "role": "3",
+      "password_sha256": "1afda89737a745f15d42807d54f67c803727d75ce443b0f3a659531b38ae660f"
+    }
+  ]
+}

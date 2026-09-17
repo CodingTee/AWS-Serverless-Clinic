@@ -1,0 +1,8 @@
+# deploy.py writes the API key into this file -- never commit it.
+serverless_config.json
+
+# build artifact from deploy.py
+lambda_function.zip
+
+__pycache__/
+*.pyc
