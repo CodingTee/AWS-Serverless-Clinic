@@ -21,7 +21,9 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import time
+import urllib.request
 from datetime import datetime
 from decimal import Decimal
 
@@ -34,10 +36,17 @@ BEDROCK_MODEL_ID = os.environ.get(
     "BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0"
 )
 # Signs session tokens. deploy.py generates a fresh value on every run.
+# Only used for the legacy (no Cognito) token path and demo parity.
 SESSION_SECRET = os.environ.get("SESSION_SECRET")
+# Amazon Cognito user pool. When set, staff and patients sign in against the
+# pool and this function verifies the pool's RS256 access tokens instead of
+# issuing its own HMAC tokens. Unset = legacy mode (passwords in DynamoDB).
+COGNITO_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
+COGNITO_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
 
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
 bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+cognito = boto3.client("cognito-idp", region_name=REGION)
 
 patients_table = dynamodb.Table("patients")
 staff_table = dynamodb.Table("staff")
@@ -60,7 +69,6 @@ TOKEN_TTL_SECONDS = 12 * 3600
 
 # Actions anyone may call before signing in.
 PRE_AUTH_ACTIONS = {"ping", "login", "patient_login"}
-
 # Which signed-in roles may call which action. Roles: 1 receptionist,
 # 2 doctor, 3 nurse, 4 patient. The matrix mirrors what the GUI actually
 # offers each role; anything not listed here is rejected for everybody.
@@ -100,6 +108,136 @@ PATIENT_OWN_ACTIONS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Cognito access-token verification (pure standard library)
+# ---------------------------------------------------------------------------
+# Cognito issues RS256-signed JWTs. Verifying (not signing!) an RS256 token
+# is plain integer math: signature^e mod n must reproduce the PKCS#1 v1.5
+# padded SHA-256 digest of the signing input. The public numbers n and e come
+# from the pool's JWKS endpoint, so no third-party JWT/crypto package is
+# needed inside the Lambda deployment package.
+_JWKS_CACHE = {"keys": None, "fetched": 0.0}
+JWKS_TTL_SECONDS = 3600
+
+# ASN.1 DigestInfo header that PKCS#1 v1.5 prepends to a SHA-256 digest.
+_SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def _b64url_decode(segment):
+    """Decode a base64url JWT segment, tolerating stripped '=' padding."""
+    padding = "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(segment + padding)
+
+
+def _fetch_json(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "clinic-backend"})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _jwks_url():
+    region = COGNITO_USER_POOL_ID.split("_", 1)[0]
+    return (
+        f"https://cognito-idp.{region}.amazonaws.com/{COGNITO_USER_POOL_ID}"
+        "/.well-known/jwks.json"
+    )
+
+
+def _load_jwks(force=False):
+    """Return the pool's signing keys, cached for JWKS_TTL_SECONDS."""
+    if not COGNITO_USER_POOL_ID:
+        raise BusinessError(
+            "The backend is not configured for Cognito. Re-run deploy.py."
+        )
+    now = time.time()
+    if not force and _JWKS_CACHE["keys"] and now - _JWKS_CACHE["fetched"] < JWKS_TTL_SECONDS:
+        return _JWKS_CACHE["keys"]
+    try:
+        keys = _fetch_json(_jwks_url()).get("keys", [])
+    except Exception as exc:  # noqa: BLE001 - a network blip must not 500
+        if _JWKS_CACHE["keys"]:
+            return _JWKS_CACHE["keys"]  # stale keys are better than no keys
+        raise BusinessError(f"Could not fetch the Cognito signing keys: {exc}")
+    _JWKS_CACHE.update(keys=keys, fetched=now)
+    return keys
+
+
+def _rs256_verify(n_int, e_int, signature, signing_input):
+    """Check an RS256 signature against a public key (n, e)."""
+    k = (n_int.bit_length() + 7) // 8
+    if len(signature) != k:
+        return False
+    s = int.from_bytes(signature, "big")
+    if s >= n_int:
+        return False
+    em = pow(s, e_int, n_int).to_bytes(k, "big")
+    digest = hashlib.sha256(signing_input).digest()
+    digest_info = _SHA256_DIGEST_INFO + digest
+    expected = (
+        b"\x00\x01" + b"\xff" * (k - len(digest_info) - 3) + b"\x00" + digest_info
+    )
+    return hmac.compare_digest(em, expected)
+
+
+def _read_cognito_token(token):
+    """Verify a Cognito access token and map its claims to session claims."""
+    if not COGNITO_USER_POOL_ID or not COGNITO_CLIENT_ID:
+        raise BusinessError(
+            "The backend is not configured for Cognito. Re-run deploy.py."
+        )
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise BusinessError("Your session is invalid. Sign in again.")
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        payload = json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        raise BusinessError("Your session is invalid. Sign in again.")
+
+    if header.get("alg") != "RS256" or not header.get("kid"):
+        raise BusinessError("Your session is invalid. Sign in again.")
+    jwk = next(
+        (k for k in _load_jwks() if k.get("kid") == header["kid"]), None
+    )
+    if jwk is None:
+        # Cognito may have rotated keys since the cache was filled: one
+        # forced refresh, then give up with the generic rejection.
+        try:
+            jwk = next(
+                (k for k in _load_jwks(force=True) if k.get("kid") == header["kid"]),
+                None,
+            )
+        except BusinessError:
+            pass
+    if jwk is None:
+        raise BusinessError("Your session is invalid. Sign in again.")
+
+    n_int = int.from_bytes(_b64url_decode(jwk["n"]), "big")
+    e_int = int.from_bytes(_b64url_decode(jwk["e"]), "big")
+    signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
+    if not _rs256_verify(n_int, e_int, signature, signing_input):
+        raise BusinessError("Your session is invalid. Sign in again.")
+
+    region = COGNITO_USER_POOL_ID.split("_", 1)[0]
+    expected_issuer = (
+        f"https://cognito-idp.{region}.amazonaws.com/{COGNITO_USER_POOL_ID}"
+    )
+    if payload.get("iss") != expected_issuer:
+        raise BusinessError("Your session is invalid. Sign in again.")
+    if payload.get("token_use") != "access":
+        raise BusinessError("Your session is invalid. Sign in again.")
+    if payload.get("client_id") != COGNITO_CLIENT_ID:
+        raise BusinessError("Your session is invalid. Sign in again.")
+    if int(payload.get("exp") or 0) < time.time():
+        raise BusinessError("Your session has expired. Sign in again.")
+
+    role = str(payload.get("custom:role") or "").strip()
+    if role not in {"1", "2", "3", "4"}:
+        raise BusinessError("Your account has no clinic role assigned.")
+    return {"role": role, "patient_id": payload.get("custom:patient_id") or None}
+
+
 def _issue_token(role, patient_id):
     """Sign a stateless session token: base64(role|patient_id|expiry).hmac."""
     if not SESSION_SECRET:
@@ -116,7 +254,21 @@ def _issue_token(role, patient_id):
 
 
 def _read_token(token):
-    """Verify a session token and return its claims, or raise BusinessError."""
+    """Verify a session token and return its claims, or raise BusinessError.
+
+    Two token shapes exist:
+      * Cognito access JWT (header.payload.signature, two dots) - verified
+        against the user pool's signing keys.
+      * Legacy HMAC token issued by this function (one dot) - used when no
+        user pool is configured, plus by the offline demo backend.
+    """
+    if token and token.count(".") == 2:
+        return _read_cognito_token(token)
+    return _read_legacy_token(token)
+
+
+def _read_legacy_token(token):
+    """Verify this function's own HMAC token and return its claims."""
     if not SESSION_SECRET:
         raise BusinessError(
             "The backend has no session secret configured. Re-run deploy.py "
@@ -256,9 +408,15 @@ def hash_password(password):
 def op_login(payload):
     """Staff sign-in against the `staff` table (passwords stored as hashes).
 
-    The client holds no accounts at all; this is the single source of truth
-    for staff identity until a Cognito authorizer replaces it.
+    Legacy path only: once a Cognito user pool is configured, staff
+    authenticate directly against the pool and this action is refused, so
+    the password column can no longer be probed through the API.
     """
+    if COGNITO_USER_POOL_ID:
+        raise BusinessError(
+            "Staff sign-in is now handled by Amazon Cognito. "
+            "Update the client or re-run deploy.py."
+        )
     require(payload, "username", "password", "role")
     username = str(payload["username"]).strip()
     role = str(payload["role"]).strip()
@@ -279,9 +437,15 @@ def op_login(payload):
 def op_patient_login(payload):
     """Patient sign-in by ID (no password, same as the original system).
 
-    Issues a role-4 token so every later call can be checked against the
-    patient's own ID server-side.
+    Legacy path only: with a Cognito user pool configured, patients sign in
+    with patient ID + password directly against the pool, so the passwordless
+    shortcut is refused here.
     """
+    if COGNITO_USER_POOL_ID:
+        raise BusinessError(
+            "Patients now sign in with their password through Amazon Cognito. "
+            "Update the client or re-run deploy.py."
+        )
     require(payload, "patient_id")
     patient_id = payload["patient_id"].strip()
     patient = patients_table.get_item(Key={"patient_id": patient_id}).get("Item")
@@ -333,7 +497,55 @@ def op_create_patient(payload):
         if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
             raise BusinessError(f"Patient ID {patient_id} already exists.")
         raise
-    return {"patient_id": patient_id}
+    # Every patient gets a Cognito account (username = patient_id) with a
+    # temporary password the receptionist hands over; Cognito forces a
+    # password change on first sign-in. No-op when no pool is configured.
+    temporary_password = _provision_patient_account(patient_id)
+    result = {"patient_id": patient_id}
+    if temporary_password:
+        result["temporary_password"] = temporary_password
+    return result
+
+
+def _provision_patient_account(patient_id):
+    """Create (or reset) the patient's Cognito login. Returns the temp password."""
+    if not COGNITO_USER_POOL_ID or not COGNITO_CLIENT_ID:
+        return None
+    temporary_password = "Clinic-" + secrets.token_urlsafe(9)
+    attributes = [
+        {"Name": "custom:role", "Value": "4"},
+        {"Name": "custom:patient_id", "Value": patient_id},
+    ]
+    try:
+        try:
+            cognito.admin_create_user(
+                UserPoolId=COGNITO_USER_POOL_ID,
+                Username=patient_id,
+                UserAttributes=attributes,
+                TemporaryPassword=temporary_password,
+                MessageAction="SUPPRESS",  # no email on file; hand it over in person
+            )
+        except cognito.exceptions.UsernameExistsException:
+            # A Cognito account for this ID already exists (patient was
+            # deleted from DynamoDB but not the pool): reset it to a fresh
+            # temporary password and re-attach the role claims.
+            cognito.admin_update_user_attributes(
+                UserPoolId=COGNITO_USER_POOL_ID,
+                Username=patient_id,
+                UserAttributes=attributes,
+            )
+            cognito.admin_set_user_password(
+                UserPoolId=COGNITO_USER_POOL_ID,
+                Username=patient_id,
+                Password=temporary_password,
+                Permanent=False,  # force a password change at next sign-in
+            )
+    except ClientError as exc:
+        raise BusinessError(
+            f"Patient saved, but creating the Cognito login failed: "
+            f"{exc.response.get('Error', {}).get('Message', exc)}"
+        )
+    return temporary_password
 
 
 def op_update_patient(payload):

@@ -30,6 +30,7 @@ Run:
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import queue
 import secrets
@@ -156,21 +157,32 @@ def apply_theme(root):
 # Errors
 # ---------------------------------------------------------------------------
 class MissingConfigError(Exception):
-    pass
+    def __init__(self, message=""):
+        super().__init__(message or "No endpoint configured yet.")
+        self.message = self.args[0]
 
 
 class ApiServerError(Exception):
     """The backend answered with ok=false and a human readable message."""
 
 
+class NewPasswordRequired(Exception):
+    """Cognito issued a NEW_PASSWORD_REQUIRED challenge (first sign-in).
+
+    Carries the challenge session and username so the login screen can show
+    a "choose a new password" dialog and complete the sign-in.
+    """
+
+    def __init__(self, session, username):
+        super().__init__("Cognito requires a new password for this account.")
+        self.session = session
+        self.username = username
+
+
 def describe_error(exc):
     """Turn any client-side exception into something worth reading."""
     if isinstance(exc, MissingConfigError):
-        return (
-            "No endpoint configured yet.\n\n"
-            "Run deploy.py first, or press 'Configure endpoint' and enter the "
-            "invoke URL and API key printed by the deployment."
-        )
+        return str(exc)
     if isinstance(exc, ApiServerError):
         return f"The backend refused the request:\n\n{exc}"
     if isinstance(exc, requests.exceptions.HTTPError):
@@ -223,6 +235,11 @@ class ApiClient:
     def __init__(self):
         self.api_url = None
         self.api_key = None
+        # Amazon Cognito user pool the client authenticates against directly
+        # (AWS mode). Written by deploy.py; empty = legacy/demo behaviour.
+        self.cognito_pool_id = None
+        self.cognito_client_id = None
+        self.region = "us-east-1"
         self._token = None  # session token issued by login/patient_login
         self.load_config()
 
@@ -238,6 +255,9 @@ class ApiClient:
                 return
             self.api_url = config.get("api_url") or None
             self.api_key = config.get("api_key") or None
+            self.cognito_pool_id = config.get("cognito_pool_id") or None
+            self.cognito_client_id = config.get("cognito_client_id") or None
+            self.region = config.get("region") or "us-east-1"
 
     def save_config(self, api_url, api_key):
         self.api_url = api_url.strip()
@@ -280,15 +300,107 @@ class ApiClient:
         return result.get("data")
 
     # -- auth --------------------------------------------------------------
+    @property
+    def cognito_ready(self):
+        return bool(self.cognito_pool_id and self.cognito_client_id)
+
+    def _ensure_cognito(self):
+        if not self.cognito_ready:
+            raise MissingConfigError(
+                "No Cognito user pool configured.\n\n"
+                "Run deploy.py first: it creates the user pool and saves "
+                "cognito_pool_id / cognito_client_id into "
+                "serverless_config.json."
+            )
+
+    def _cognito_call(self, target, body):
+        """Call the Cognito Identity Provider HTTP API (no SDK needed)."""
+        url = f"https://cognito-idp.{self.region}.amazonaws.com/"
+        response = requests.post(
+            url,
+            json=body,
+            headers={
+                "Content-Type": "application/x-amz-json-1.1",
+                "X-Amz-Target": f"AWSCognitoIdentityProviderService.{target}",
+            },
+            timeout=15,
+        )
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        if not response.ok:
+            code = data.get("__type", "").split("#")[-1]
+            message = data.get("message") or f"Cognito error (HTTP {response.status_code})"
+            if code in ("NotAuthorizedException", "UserNotFoundException"):
+                raise ValueError(
+                    "Incorrect username or password."
+                    if code == "NotAuthorizedException"
+                    else "No account with that username."
+                )
+            raise ApiServerError(message)
+        return data
+
+    @staticmethod
+    def _decode_jwt_payload(token):
+        """Read the middle segment of a JWT (payload only, no verification;
+        it arrived over TLS straight from Cognito). Used for display fields
+        like the role and username claims."""
+        segment = token.split(".")[1]
+        segment += "=" * (-len(segment) % 4)
+        return json.loads(base64.urlsafe_b64decode(segment))
+
+    def _cognito_sign_in(self, username, password):
+        """USER_PASSWORD_AUTH sign-in, returns the same shape as the old
+        backend login so the screens do not change."""
+        self._ensure_cognito()
+        auth = self._cognito_call("InitiateAuth", {
+            "AuthFlow": "USER_PASSWORD_AUTH",
+            "AuthParameters": {"USERNAME": username, "PASSWORD": password},
+            "ClientId": self.cognito_client_id,
+        })
+        if auth.get("ChallengeName") == "NEW_PASSWORD_REQUIRED":
+            raise NewPasswordRequired(auth.get("Session"), username)
+        token = auth["AuthenticationResult"]["AccessToken"]
+        claims = self._decode_jwt_payload(token)
+        return {
+            "role": str(claims.get("custom:role") or ""),
+            "display_name": claims.get("username", username),
+            "token": token,
+        }
+
+    def complete_new_password(self, username, new_password, session):
+        """Finish a NEW_PASSWORD_REQUIRED challenge (first patient sign-in)."""
+        auth = self._cognito_call("RespondToAuthChallenge", {
+            "ChallengeName": "NEW_PASSWORD_REQUIRED",
+            "Session": session,
+            "ChallengeResponses": {
+                "USERNAME": username,
+                "NEW_PASSWORD": new_password,
+            },
+            "ClientId": self.cognito_client_id,
+        })
+        token = auth["AuthenticationResult"]["AccessToken"]
+        claims = self._decode_jwt_payload(token)
+        return {
+            "role": str(claims.get("custom:role") or ""),
+            "display_name": claims.get("username", username),
+            "token": token,
+        }
+
     def login(self, username, password, role):
-        result = self.call("login", username=username, password=password, role=role)
+        result = self._cognito_sign_in(username, password)
+        if result["role"] != str(role):
+            raise ValueError("This account belongs to a different role.")
         self._token = result["token"]
         return result
 
-    def patient_login(self, patient_id):
-        result = self.call("patient_login", patient_id=patient_id)
+    def patient_login(self, patient_id, password=""):
+        result = self._cognito_sign_in(patient_id, password)
+        if result["role"] != "4":
+            raise ValueError("This account is not a patient account.")
         self._token = result["token"]
-        return result
+        return {"patient_id": patient_id, "role": "4", "token": result["token"]}
 
     # -- patients ----------------------------------------------------------
     def get_patient(self, patient_id):
@@ -579,7 +691,9 @@ class DemoBackend:
         self._token = result["token"]
         return result
 
-    def patient_login(self, patient_id):
+    def patient_login(self, patient_id, password=""):
+        # Demo has no Cognito: the password (typed for AWS mode) is ignored
+        # and the ID-only sign-in of the original system applies.
         result = self.call("patient_login", patient_id=patient_id)
         self._token = result["token"]
         return result
@@ -1170,13 +1284,13 @@ class LoginFrame(ttk.Frame):
         ttk.Label(self, text="Clinic Management System", style="Title.TLabel").pack(pady=(40, 4))
         ttk.Label(
             self,
-            text="Sign in with a role. Patients use their patient ID instead of a password.",
+            text="Sign in with a role. Staff use username + password, patients use their patient ID + password.",
             style="Muted.TLabel",
         ).pack(pady=(0, 6))
         ttk.Label(
             self,
-            text="Staff accounts live in the backend (demo: demo_data.json, "
-                 "AWS: DynamoDB staff table). Patient: sign in with ID B01.",
+            text="Accounts live in Amazon Cognito (demo mode: demo_data.json). "
+                 "A first-time patient password is changed at first sign-in.",
             style="Muted.TLabel",
             font=font(9),
         ).pack(pady=(0, 18))
@@ -1232,9 +1346,10 @@ class LoginFrame(ttk.Frame):
 
     def on_role_change(self, _event=None):
         is_patient = self.role.get() == ROLE_LABELS["4"]
-        state = "disabled" if is_patient else "normal"
-        self.username_entry.configure(state=state)
-        self.password_entry.configure(state=state)
+        self.username_entry.configure(state="disabled" if is_patient else "normal")
+        # Patients type a password too (Cognito sign-in in AWS mode; ignored
+        # by the demo backend, which has no Cognito).
+        self.password_entry.configure(state="normal")
         self.patient_entry.configure(state="normal" if is_patient else "disabled")
 
     def on_source_change(self, _event=None):
@@ -1304,11 +1419,14 @@ class LoginFrame(ttk.Frame):
             if not patient_id:
                 messagebox.showwarning("Missing ID", "Enter the patient ID.", parent=self)
                 return
-            self.app.set_status(f"Looking up patient {patient_id} ...")
+            # Read tk variables HERE, on the main thread; worker threads must
+            # never touch Tk (StringVar.get() included).
+            password = self.password.get()
+            self.app.set_status(f"Signing in patient {patient_id} ...")
             self.app.run_async(
-                lambda: self.app.db.patient_login(patient_id),
-                lambda patient: self.finish_patient_login(patient_id, patient),
-                self.app.show_error,
+                lambda: self.app.db.patient_login(patient_id, password),
+                lambda _result: self._after_patient_auth(patient_id),
+                self._on_auth_error,
             )
             return
 
@@ -1319,19 +1437,71 @@ class LoginFrame(ttk.Frame):
             )
             return
 
-        # Both modes: the backend owns staff accounts (demo -> demo_data.json,
-        # AWS -> DynamoDB staff table). This client holds no credentials.
-        # NOTE: read the tk variables HERE, on the main thread; the worker
-        # thread must never touch Tk (StringVar.get() included).
+        # Both modes: accounts live in the backend (AWS: Cognito user pool,
+        # demo: demo_data.json). This client holds no credentials.
         password = self.password.get()
-        self.app.set_status(f"Looking up staff account {username} ...")
+        self.app.set_status(f"Signing in as {username} ...")
         self.app.run_async(
             lambda: self.app.db.login(username, password, role_code),
             lambda result: self.app.login_success(
                 result["role"], result["display_name"]
             ),
-            self.app.show_error,
+            self._on_auth_error,
         )
+
+    def _after_patient_auth(self, patient_id):
+        """Fetch the patient record so the header can show the real name.
+
+        Cognito does not return profile fields, so the just-issued role-4
+        token is used for an own-records get_patient (demo mode already
+        returns the name from patient_login; the extra read is harmless).
+        """
+        self.app.run_async(
+            lambda: self.app.db.get_patient(patient_id),
+            lambda patient: self.finish_patient_login(
+                patient_id, patient or {"patient_id": patient_id}
+            ),
+            self._on_auth_error,
+        )
+
+    def _on_auth_error(self, exc):
+        if isinstance(exc, NewPasswordRequired) and self.app.data_source_mode == "aws":
+            self._prompt_new_password(exc)
+        else:
+            self.app.show_error(exc)
+
+    def _prompt_new_password(self, pending):
+        self.app.set_status("First sign-in: choose a new password.")
+        FormDialog(
+            self,
+            "Choose a new password",
+            [
+                {"key": "new_password", "label": "New password", "secret": True},
+                {"key": "confirm", "label": "Repeat new password", "secret": True},
+            ],
+            submit_label="Save and sign in",
+            on_submit=lambda values: self._submit_new_password(pending, values),
+        )
+
+    def _submit_new_password(self, pending, values):
+        new_password = values["new_password"]
+        if not new_password:
+            return "Enter a new password."
+        if len(new_password) < 6:
+            return "The password must be at least 6 characters."
+        if new_password != values["confirm"]:
+            return "The two passwords do not match."
+        self.app.run_async(
+            lambda: self.app.db.complete_new_password(
+                pending.username, new_password, pending.session
+            ),
+            lambda result: self.app.login_success(
+                result["role"], result["display_name"],
+                patient_id=pending.username if result["role"] == "4" else None,
+            ),
+            self._on_auth_error,
+        )
+        return None
 
     def finish_patient_login(self, patient_id, patient):
         if not patient:
@@ -1580,12 +1750,29 @@ class ClinicApp(tk.Tk):
     def submit_register(self, values):
         if not all(values.values()):
             return "Every field is required."
+
+        def registered(result):
+            self.set_status(f"Patient {values['patient_id']} registered")
+            temporary_password = (result or {}).get("temporary_password")
+            if temporary_password:
+                message = (
+                    f"Patient {values['patient_id']} was added.\n\n"
+                    f"Cognito sign-in (AWS mode):\n"
+                    f"  Username: {values['patient_id']}\n"
+                    f"  Temporary password: {temporary_password}\n\n"
+                    "Hand it to the patient; they must choose a new "
+                    "password at first sign-in."
+                )
+            else:
+                message = (
+                    f"Patient {values['patient_id']} was added.\n\n"
+                    "Demo mode: the patient signs in with their ID only."
+                )
+            messagebox.showinfo("Registered", message, parent=self)
+
         self.run_async(
             lambda: self.db.create_patient(values),
-            lambda _result: (
-                self.set_status(f"Patient {values['patient_id']} registered"),
-                messagebox.showinfo("Registered", f"Patient {values['patient_id']} was added.", parent=self),
-            ),
+            registered,
             self.show_error,
         )
         return None

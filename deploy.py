@@ -4,19 +4,23 @@ Creates (or updates) everything the backend needs, using your local AWS
 credentials (the standard boto3 chain, i.e. ~/.aws/credentials or environment
 variables. No keys are written into any file this script produces):
 
-  1. IAM role  clinic-serverless-role        Lambda execution role with
-                                             DynamoDB + Bedrock permissions
-  2. Lambda    clinic-serverless-backend     from lambda_function.py in this folder
-  3. REST API  clinic-serverless-api         POST /call, API key required
-  4. API key   clinic-client-key             printed at the end, paste it into
-                                             serverless_config.json on the client
+  1. IAM role      clinic-serverless-role        Lambda execution role with
+                                                 DynamoDB + Bedrock + Cognito
+                                                 permissions
+  2. Cognito       clinic-users                  user pool + app client; staff
+      User Pool    clinic-desktop-client         and patient accounts live here
+  3. Lambda        clinic-serverless-backend     from lambda_function.py in this
+                                                 folder, verifies Cognito JWTs
+  4. REST API      clinic-serverless-api         POST /call, API key required
+  5. API key       clinic-client-key             printed at the end, paste it into
+                                                 serverless_config.json on the client
 
 Usage:
     python deploy.py
 
 Re-running is safe: existing resources are updated in place, not duplicated.
-The invoke URL and API key are also saved to serverless_config.json next to
-the client script, so it works out of the box.
+The invoke URL, API key and Cognito IDs are also saved to
+serverless_config.json next to the client script, so it works out of the box.
 """
 
 import hashlib
@@ -38,6 +42,23 @@ RESOURCE_PATH = "call"
 API_KEY_NAME = "clinic-client-key"
 USAGE_PLAN_NAME = "clinic-client-plan"
 BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0"
+
+# Cognito: password policy is deliberately lenient (the seeded demo accounts
+# use short passwords); everything hard (salted hashing, lockout, optional
+# MFA) is Cognito's job now, not ours.
+USER_POOL_NAME = "clinic-users"
+APP_CLIENT_NAME = "clinic-desktop-client"
+ACCESS_TOKEN_HOURS = 12  # matches the old 12-hour session token lifetime
+
+dynamodb_c = boto3.client("dynamodb", region_name=REGION)
+cognito = boto3.client("cognito-idp", region_name=REGION)
+iam = boto3.client("iam", region_name=REGION)
+lam = boto3.client("lambda", region_name=REGION)
+apigw = boto3.client("apigateway", region_name=REGION)
+dynamodb = boto3.resource("dynamodb", region_name=REGION)
+sts = boto3.client("sts", region_name=REGION)
+
+account_id = sts.get_caller_identity()["Account"]
 
 # key_schema: (hash_key, range_key or None). gsi: (name, hash_key) or None.
 # gsis: [(name, hash_key), ...] for tables that need more than one index.
@@ -65,13 +86,6 @@ STAFF_SEED = [
     {"username": "Charlie", "role": "3", "password": "charlie123"},
 ]
 
-iam = boto3.client("iam", region_name=REGION)
-lam = boto3.client("lambda", region_name=REGION)
-apigw = boto3.client("apigateway", region_name=REGION)
-dynamodb = boto3.resource("dynamodb", region_name=REGION)
-sts = boto3.client("sts", region_name=REGION)
-
-account_id = sts.get_caller_identity()["Account"]
 TABLE_ARNS = [f"arn:aws:dynamodb:{REGION}:{account_id}:table/{name}" for name in TABLES]
 
 
@@ -166,9 +180,155 @@ def seed_staff():
 
 
 # ---------------------------------------------------------------------------
+# 0b. Cognito user pool, app client and accounts
+# ---------------------------------------------------------------------------
+def ensure_user_pool():
+    step("Ensuring Cognito user pool")
+    pools = cognito.list_user_pools(MaxResults=60)["UserPools"]
+    pool = next((p for p in pools if p["Name"] == USER_POOL_NAME), None)
+    if pool is None:
+        pool = cognito.create_user_pool(
+            PoolName=USER_POOL_NAME,
+            Policies={"PasswordPolicy": {
+                "MinimumLength": 6,
+                "RequireUppercase": False,
+                "RequireLowercase": False,
+                "RequireNumbers": False,
+                "RequireSymbols": False,
+            }},
+            Schema=[
+                # custom:* attributes that travel inside every access token,
+                # so the Lambda can map a verified token to ACTION_ROLES.
+                {"Name": "role", "AttributeDataType": "String", "Mutable": True},
+                {"Name": "patient_id", "AttributeDataType": "String", "Mutable": True},
+            ],
+            MfaConfiguration="OFF",
+            # Accounts exist only because an admin (deploy.py / create_patient)
+            # created them: no self sign-up, no email verification (patients
+            # have no verified email in this system).
+            AdminCreateUserConfig={"AllowAdminCreateUserOnly": True},
+        )["UserPool"]
+        ok(f"Created user pool {USER_POOL_NAME}")
+    else:
+        ok(f"User pool {USER_POOL_NAME} already exists")
+    return pool["Id"]
+
+
+def ensure_app_client(pool_id):
+    step("Ensuring Cognito app client")
+    clients = cognito.list_user_pool_clients(
+        UserPoolId=pool_id, MaxResults=60
+    )["UserPoolClients"]
+    client = next((c for c in clients if c["ClientName"] == APP_CLIENT_NAME), None)
+    if client is None:
+        client = cognito.create_user_pool_client(
+            UserPoolId=pool_id,
+            ClientName=APP_CLIENT_NAME,
+            GenerateSecret=False,  # desktop client: public app client
+            ExplicitAuthFlows=[
+                "ALLOW_USER_PASSWORD_AUTH",
+                "ALLOW_REFRESH_TOKEN_AUTH",
+            ],
+            AccessTokenValidity=ACCESS_TOKEN_HOURS,
+            RefreshTokenValidity=30,
+        )["UserPoolClient"]
+        ok(f"Created app client {APP_CLIENT_NAME}")
+    else:
+        ok(f"App client {APP_CLIENT_NAME} already exists")
+    return client["ClientId"]
+
+
+def seed_cognito_staff(pool_id):
+    step("Seeding Cognito staff accounts")
+    for account in STAFF_SEED:
+        existed = True
+        try:
+            cognito.admin_create_user(
+                UserPoolId=pool_id,
+                Username=account["username"],
+                UserAttributes=[
+                    {"Name": "custom:role", "Value": account["role"]},
+                ],
+                # Must satisfy the pool's password policy; set as permanent
+                # right after, so staff sign in without a first-login change.
+                TemporaryPassword=account["password"],
+                MessageAction="SUPPRESS",
+            )
+            existed = False
+        except cognito.exceptions.UsernameExistsException:
+            pass
+        # Permanent password + role attribute: also repairs pre-existing
+        # accounts whose role claim drifted from STAFF_SEED.
+        cognito.admin_set_user_password(
+            UserPoolId=pool_id,
+            Username=account["username"],
+            Password=account["password"],
+            Permanent=True,
+        )
+        cognito.admin_update_user_attributes(
+            UserPoolId=pool_id,
+            Username=account["username"],
+            UserAttributes=[{"Name": "custom:role", "Value": account["role"]}],
+        )
+        ok(f"{account['username']} (role {account['role']})"
+           + (" updated" if existed else " created"))
+    ok("Staff sign in with their usual username + password")
+
+
+def provision_existing_patients(pool_id):
+    """Give every patient already in DynamoDB a Cognito account.
+
+    New patients get accounts automatically when a receptionist runs
+    create_patient; this one-off step covers data predating Cognito. Each
+    patient's temporary password is printed exactly once - the client forces
+    a password change at first sign-in.
+    """
+    step("Provisioning Cognito accounts for existing patients")
+    response = dynamodb_c.scan(TableName="patients")
+    patients = response.get("Items", [])
+    while "LastEvaluatedKey" in response:
+        response = dynamodb_c.scan(
+            TableName="patients",
+            ExclusiveStartKey=response["LastEvaluatedKey"],
+        )
+        patients.extend(response.get("Items", []))
+    if not patients:
+        ok("No existing patients found")
+        return
+    created = 0
+    for patient in patients:
+        patient_id = next(
+            (v["S"] for k, v in patient.items() if k == "patient_id"), None
+        )
+        if not patient_id:
+            continue
+        try:
+            cognito.admin_get_user(UserPoolId=pool_id, Username=patient_id)
+            ok(f"{patient_id} already has an account")
+            continue
+        except cognito.exceptions.UserNotFoundException:
+            pass
+        temporary_password = "Clinic-" + secrets.token_hex(4)
+        cognito.admin_create_user(
+            UserPoolId=pool_id,
+            Username=patient_id,
+            UserAttributes=[
+                {"Name": "custom:role", "Value": "4"},
+                {"Name": "custom:patient_id", "Value": patient_id},
+            ],
+            TemporaryPassword=temporary_password,
+            MessageAction="SUPPRESS",
+        )
+        created += 1
+        ok(f"{patient_id}: temporary password {temporary_password}")
+    if not created:
+        ok("All patient accounts already exist")
+
+
+# ---------------------------------------------------------------------------
 # 1. IAM role
 # ---------------------------------------------------------------------------
-def ensure_role():
+def ensure_role(pool_id):
     step("Ensuring IAM role")
     trust = {
         "Version": "2012-10-17",
@@ -207,10 +367,19 @@ def ensure_role():
                     "Action": ["bedrock:InvokeModel"],
                     "Resource": "*",
                 },
+                {
+                    # create_patient provisions the patient's Cognito login.
+                    "Effect": "Allow",
+                    "Action": ["cognito-idp:AdminCreateUser",
+                               "cognito-idp:AdminSetUserPassword",
+                               "cognito-idp:AdminUpdateUserAttributes"],
+                    "Resource": f"arn:aws:cognito-idp:{REGION}:{account_id}:userpool/{pool_id}",
+                },
             ],
         }),
     )
-    ok(f"Permissions attached (DynamoDB on the {len(TABLES)} tables + Bedrock InvokeModel)")
+    ok(f"Permissions attached (DynamoDB on the {len(TABLES)} tables "
+       "+ Bedrock InvokeModel + patient Cognito provisioning)")
     return role["Arn"]
 
 
@@ -227,11 +396,18 @@ def zip_lambda():
     return Path(__file__).with_name("lambda_function.zip").read_bytes()
 
 
-def ensure_lambda(role_arn, code_bytes):
+def ensure_lambda(role_arn, code_bytes, pool_id, client_id):
     step("Ensuring Lambda function")
-    # Signs client session tokens. Fresh value per run: old tokens simply
-    # stop working after a redeploy, which is the behaviour we want.
+    # Signs the legacy session tokens (unused once Cognito is configured, but
+    # kept so the backend still works if the pool env vars are removed).
+    # Fresh value per run: old tokens simply stop working after a redeploy.
     session_secret = secrets.token_hex(32)
+    environment = {"Variables": {
+        "BEDROCK_MODEL_ID": BEDROCK_MODEL_ID,
+        "SESSION_SECRET": session_secret,
+        "COGNITO_USER_POOL_ID": pool_id,
+        "COGNITO_CLIENT_ID": client_id,
+    }}
     try:
         lam.get_function(FunctionName=FUNCTION_NAME)
         lam.update_function_code(
@@ -243,10 +419,7 @@ def ensure_lambda(role_arn, code_bytes):
             Handler="lambda_function.lambda_handler",
             Timeout=30,
             MemorySize=256,
-            Environment={"Variables": {
-                "BEDROCK_MODEL_ID": BEDROCK_MODEL_ID,
-                "SESSION_SECRET": session_secret,
-            }},
+            Environment=environment,
         )
         ok(f"Updated existing function {FUNCTION_NAME}")
     except lam.exceptions.ResourceNotFoundException:
@@ -260,10 +433,7 @@ def ensure_lambda(role_arn, code_bytes):
                     ZipFile=code_bytes,
                     Timeout=30,
                     MemorySize=256,
-                    Environment={"Variables": {
-                        "BEDROCK_MODEL_ID": BEDROCK_MODEL_ID,
-                        "SESSION_SECRET": session_secret,
-                    }},
+                    Environment=environment,
                 )
                 ok(f"Created function {FUNCTION_NAME}")
                 break
@@ -420,11 +590,15 @@ def main():
     print("Clinic serverless backend deployment")
     print(f"region: {REGION}  account: {account_id}")
 
-    role_arn = ensure_role()
     ensure_tables()
     seed_staff()
+    pool_id = ensure_user_pool()
+    client_id = ensure_app_client(pool_id)
+    seed_cognito_staff(pool_id)
+    provision_existing_patients(pool_id)
+    role_arn = ensure_role(pool_id)
     code_bytes = zip_lambda()
-    lambda_arn = ensure_lambda(role_arn, code_bytes)
+    lambda_arn = ensure_lambda(role_arn, code_bytes, pool_id, client_id)
     api_id = ensure_api(lambda_arn)
     key, plan_id, staged = ensure_api_key()
     bind_key_to_stage(key, plan_id, api_id, staged)
@@ -441,13 +615,20 @@ def main():
             pass
     config["api_url"] = url
     config["api_key"] = key["value"]
+    config["region"] = REGION
+    config["cognito_pool_id"] = pool_id
+    config["cognito_client_id"] = client_id
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     print("\n================ DONE ================")
     print(f"Invoke URL : {url}")
     print(f"API key    : {key['value']}")
+    print(f"User pool  : {pool_id}")
+    print(f"App client : {client_id}")
     print(f"Saved to   : {config_path}")
     print("The client reads this file automatically. Keep the key out of git.")
+    print("Sign-in now goes through Amazon Cognito; patients created before")
+    print("this run received temporary passwords printed above.")
     print("======================================")
 
 
